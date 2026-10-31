@@ -51,3 +51,5 @@
 .option-result.correct{border-color:#8eae5a;background-image:linear-gradient(#e4f0cf,#e4f0cf)}
 .option-result .or-text{flex:1}
 .option-result svg{color:#6d8c42}
+.results-next{width:100%;margin-top:18px}
+.host-results,.host-final{margin-bottom:18px;max-width:none}

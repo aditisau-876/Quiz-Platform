@@ -40,7 +40,7 @@ app.post("/api/quizzes", requireAdmin, async (req: AuthRequest, res) => {
   const quiz = await prisma.quiz.create({ data: { ...parsed.data, ownerId: req.adminId! } }); res.status(201).json(quiz);
 });
 app.get("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
-  const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } });
+  const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: { orderBy: { id: "asc" } } } } } });
   if (!quiz) return res.status(404).json({ error: "Quiz not found" }); res.json(quiz);
 });
 app.put("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
@@ -64,7 +64,7 @@ app.delete("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
   res.status(204).end();
 });
 app.post("/api/quizzes/:id/duplicate", requireAdmin, async (req: AuthRequest, res) => {
-  const src = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } });
+  const src = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: { orderBy: { id: "asc" } } } } } });
   if (!src) return res.status(404).json({ error: "Quiz not found" });
   const copy = await prisma.quiz.create({
     data: {
@@ -79,7 +79,7 @@ app.post("/api/quizzes/:id/questions", requireAdmin, async (req: AuthRequest, re
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
   const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!quiz) return res.status(404).json({ error: "Quiz not found" });
   const order = await prisma.question.count({ where: { quizId: quiz.id } });
-  const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: true } });
+  const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
   res.status(201).json(q);
 });
 async function hasLiveSession(quizId: string) {
@@ -92,7 +92,7 @@ app.put("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   if (await hasLiveSession(q.quizId)) return res.status(409).json({ error: LIVE_MSG });
   const updated = await prisma.$transaction(async tx => {
     await tx.answerOption.deleteMany({ where: { questionId: q.id } });
-    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation ?? null, options: { create: parsed.data.options } }, include: { options: true } });
+    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation ?? null, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
   });
   res.json(updated);
 });
@@ -112,7 +112,7 @@ type PublicQuestion = { id: string; text: string; timeLimitSeconds: number; opti
 const room = (id: string) => `session:${id}`;
 const timerHandles = new Map<string, NodeJS.Timeout>();
 async function publicQuestion(sessionId: string, index: number): Promise<PublicQuestion | null> {
-  const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } } } });
+  const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { questions: { orderBy: { order: "asc" }, include: { options: { orderBy: { id: "asc" } } } } } } } });
   const q = session?.quiz.questions[index]; if (!q) return null;
   return { id: q.id, text: q.text, timeLimitSeconds: q.timeLimitSeconds, options: q.options.map(o => ({ id: o.id, text: o.text })) };
 }
@@ -124,7 +124,7 @@ async function finishQuestion(sessionId: string) {
   const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: true, participants: { include: { answers: true } } } });
   if (!session || session.status !== "ACTIVE") return;
   const index = session.currentQuestionIndex;
-  const q = await prisma.question.findFirst({ where: { quizId: session.quizId, order: index }, include: { options: true } });
+  const q = await prisma.question.findFirst({ where: { quizId: session.quizId, order: index }, include: { options: { orderBy: { id: "asc" } } } });
   if (!q) return;
   const ranked = session.participants
     .map(p => ({ participantId: p.id, name: p.name, answer: p.answers.find(a => a.questionId === q.id) }))
@@ -146,7 +146,7 @@ async function finishQuestion(sessionId: string) {
   }
   const totalQuestions = await prisma.question.count({ where: { quizId: session.quizId } });
   io.to(room(sessionId)).emit("question:results", {
-    questionId: q.id, explanation: q.explanation, leaderboard: ranked,
+    questionId: q.id, questionText: q.text, options: q.options.map(o => ({ id: o.id, text: o.text })), explanation: q.explanation, leaderboard: ranked,
     correctOptionId: q.options.find(o => o.isCorrect)?.id ?? null, optionCounts,
     answered: answeredCount, correctCount, total: session.participants.length,
     questionNumber: index + 1, totalQuestions, isLast: index + 1 >= totalQuestions
@@ -255,7 +255,7 @@ io.on("connection", socket => {
       if (!p || p.session.status !== "ACTIVE" || !p.session.deadline || !p.session.questionStartedAt) return socket.emit("answer:error", "This question is no longer accepting answers");
       const receivedAt = new Date();
       if (receivedAt.getTime() > p.session.deadline.getTime()) return socket.emit("answer:error", "Time is up");
-      const q = await prisma.question.findFirst({ where: { quizId: p.session.quizId, order: p.session.currentQuestionIndex }, include: { options: true } });
+      const q = await prisma.question.findFirst({ where: { quizId: p.session.quizId, order: p.session.currentQuestionIndex }, include: { options: { orderBy: { id: "asc" } } } });
       if (!q || !q.options.some(o => o.id === optionId)) return socket.emit("answer:error", "Invalid answer option");
       const correct = q.options.some(o => o.id === optionId && o.isCorrect);
       const totalMs = q.timeLimitSeconds * 1000;
