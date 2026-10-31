@@ -137,7 +137,20 @@ async function finishQuestion(sessionId: string) {
     return { participantId: p.id, correct: answer?.status === "CORRECT", points: answer?.points ?? 0, totalPoints: p.answers.reduce((sum, a) => sum + a.points, 0) };
   });
   await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "BETWEEN_QUESTIONS", deadline: null } });
-  io.to(room(sessionId)).emit("question:results", { questionId: q.id, explanation: q.explanation, leaderboard: ranked });
+  const optionCounts: Record<string, number> = {};
+  let answeredCount = 0, correctCount = 0;
+  for (const p of session.participants) {
+    const a = p.answers.find(x => x.questionId === q.id); if (!a) continue;
+    answeredCount++; if (a.status === "CORRECT") correctCount++;
+    if (a.optionId) optionCounts[a.optionId] = (optionCounts[a.optionId] ?? 0) + 1;
+  }
+  const totalQuestions = await prisma.question.count({ where: { quizId: session.quizId } });
+  io.to(room(sessionId)).emit("question:results", {
+    questionId: q.id, explanation: q.explanation, leaderboard: ranked,
+    correctOptionId: q.options.find(o => o.isCorrect)?.id ?? null, optionCounts,
+    answered: answeredCount, correctCount, total: session.participants.length,
+    questionNumber: index + 1, totalQuestions, isLast: index + 1 >= totalQuestions
+  });
   for (const result of individual) io.to(`participant:${result.participantId}`).emit("participant:result", { correct: result.correct, points: result.points, totalPoints: result.totalPoints });
 }
 function clearTimer(id: string) { const t = timerHandles.get(id); if (t) clearTimeout(t); timerHandles.delete(id); }

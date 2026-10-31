@@ -42,3 +42,12 @@
 .host-live p{margin:10px 0 0;font-size:13px;line-height:1.5}
 .host-final{grid-column:1/-1;max-width:none}
 .host-final h3{display:flex;gap:8px;align-items:center;font-size:17px}
+
+/* --- host per-question results --- */
+.host-results{grid-column:1/-1}
+.host-results h3{font-size:22px;margin:10px 0 18px}
+.option-results{display:flex;flex-direction:column;gap:9px;margin-bottom:14px}
+.option-result{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid #e4e9e2;border-radius:10px;font-size:14px;background:linear-gradient(#eef1ec,#eef1ec) no-repeat left/0 100%;transition:background-size .4s}
+.option-result.correct{border-color:#8eae5a;background-image:linear-gradient(#e4f0cf,#e4f0cf)}
+.option-result .or-text{flex:1}
+.option-result svg{color:#6d8c42}
