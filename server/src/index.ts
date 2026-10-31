@@ -8,7 +8,6 @@ import { Server } from "socket.io";
 import { z } from "zod";
 import { prisma } from "./db.js";
 import { requireAdmin, signAdmin, type AuthRequest } from "./auth.js";
-import { resolve } from "node:path";
 
 const app = express();
 const httpServer = createServer(app);
@@ -28,7 +27,7 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.post("/api/auth/login", async (req, res) => {
   const parsed = z.object({ email: z.string().email(), password: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid credentials" });
-  const admin = await prisma.admin.findUnique({where: { email: parsed.data.email.trim().toLowerCase() }});
+  const admin = await prisma.admin.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
   if (!admin || !(await bcrypt.compare(parsed.data.password, admin.passwordHash))) return res.status(401).json({ error: "Invalid email or password" });
   res.json({ token: signAdmin(admin.id), email: admin.email });
 });
@@ -41,28 +40,28 @@ app.post("/api/quizzes", requireAdmin, async (req: AuthRequest, res) => {
   const quiz = await prisma.quiz.create({ data: { ...parsed.data, ownerId: req.adminId! } }); res.status(201).json(quiz);
 });
 app.get("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
-  const quiz = await prisma.quiz.findFirst({ where: { id: req.params.id, ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } });
+  const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } });
   if (!quiz) return res.status(404).json({ error: "Quiz not found" }); res.json(quiz);
 });
 app.put("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
   const parsed = quizInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-  const owned = await prisma.quiz.findFirst({ where: { id: req.params.id, ownerId: req.adminId } }); if (!owned) return res.status(404).json({ error: "Quiz not found" });
+  const owned = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!owned) return res.status(404).json({ error: "Quiz not found" });
   res.json(await prisma.quiz.update({ where: { id: owned.id }, data: parsed.data }));
 });
 app.delete("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
-  const owned = await prisma.quiz.findFirst({ where: { id: req.params.id, ownerId: req.adminId } }); if (!owned) return res.status(404).json({ error: "Quiz not found" });
+  const owned = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!owned) return res.status(404).json({ error: "Quiz not found" });
   await prisma.quiz.delete({ where: { id: owned.id } }); res.status(204).end();
 });
 app.post("/api/quizzes/:id/questions", requireAdmin, async (req: AuthRequest, res) => {
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-  const quiz = await prisma.quiz.findFirst({ where: { id: req.params.id, ownerId: req.adminId } }); if (!quiz) return res.status(404).json({ error: "Quiz not found" });
+  const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!quiz) return res.status(404).json({ error: "Quiz not found" });
   const order = await prisma.question.count({ where: { quizId: quiz.id } });
   const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: true } });
   res.status(201).json(q);
 });
 app.put("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-  const q = await prisma.question.findFirst({ where: { id: req.params.id, quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
+  const q = await prisma.question.findFirst({ where: { id: String(req.params.id), quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
   const updated = await prisma.$transaction(async tx => {
     await tx.answerOption.deleteMany({ where: { questionId: q.id } });
     return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: true } });
@@ -70,7 +69,7 @@ app.put("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   res.json(updated);
 });
 app.delete("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
-  const q = await prisma.question.findFirst({ where: { id: req.params.id, quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
+  const q = await prisma.question.findFirst({ where: { id: String(req.params.id), quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
   await prisma.question.delete({ where: { id: q.id } }); res.status(204).end();
 });
 
@@ -129,15 +128,16 @@ async function finalResults(sessionId: string) {
   return { leaderboard, questions: session.quiz.questions.map(q => ({ id: q.id, text: q.text })) };
 }
 app.post("/api/quizzes/:id/sessions", requireAdmin, async (req: AuthRequest, res) => {
-  const quiz = await prisma.quiz.findFirst({ where: { id: req.params.id, ownerId: req.adminId }, include: { questions: true } });
+  const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } });
   if (!quiz) return res.status(404).json({ error: "Quiz not found" });
-  if (!quiz.questions.length) return res.status(400).json({ error: "Add at least one question before starting a session" });
+  const questionCount = await prisma.question.count({ where: { quizId: quiz.id } });
+  if (questionCount === 0) return res.status(400).json({ error: "Add at least one question before starting a session" });
   let pin = ""; for (let i = 0; i < 10; i++) { pin = String(Math.floor(100000 + Math.random() * 900000)); if (!(await prisma.quizSession.findUnique({ where: { pin } }))) break; }
   const session = await prisma.quizSession.create({ data: { pin, quizId: quiz.id } });
   res.status(201).json(session);
 });
 app.get("/api/sessions/:id/results", requireAdmin, async (req: AuthRequest, res) => {
-  const session = await prisma.quizSession.findFirst({ where: { id: req.params.id, quiz: { ownerId: req.adminId } } }); if (!session) return res.status(404).json({ error: "Session not found" });
+  const session = await prisma.quizSession.findFirst({ where: { id: String(req.params.id), quiz: { ownerId: req.adminId } } }); if (!session) return res.status(404).json({ error: "Session not found" });
   res.json(await finalResults(session.id));
 });
 
@@ -238,14 +238,6 @@ io.on("connection", socket => {
     clearTimer(sessionId); await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "FINISHED", endedAt: new Date(), deadline: null } });
     io.to(room(sessionId)).emit("quiz:finished", await finalResults(sessionId));
   });
-});
-// Serve the React frontend from the same Render service.
-const clientDist = resolve(process.cwd(), "client", "dist");
-
-app.use(express.static(clientDist));
-
-app.get("/{*path}", (_req, res) => {
-  res.sendFile(resolve(clientDist, "index.html"));
 });
 
 const port = Number(process.env.PORT ?? 4000);
