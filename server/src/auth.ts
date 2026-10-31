@@ -13,3 +13,9 @@ export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction
     req.adminId = payload.sub; next();
   } catch { return res.status(401).json({ error: "Invalid or expired token" }); }
 }
+export function verifyAdminToken(token: string): string | null {
+  try {
+    const payload = jwt.verify(token, secret) as jwt.JwtPayload;
+    return payload.role === "admin" && typeof payload.sub === "string" ? payload.sub : null;
+  } catch { return null; }
+}

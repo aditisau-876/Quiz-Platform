@@ -1,13 +1,13 @@
 import "dotenv/config";
 import express from "express";
-import jwt from "jsonwebtoken";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { Server } from "socket.io";
 import { z } from "zod";
 import { prisma } from "./db.js";
-import { requireAdmin, signAdmin, type AuthRequest } from "./auth.js";
+import { requireAdmin, signAdmin, verifyAdminToken, type AuthRequest } from "./auth.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -50,7 +50,30 @@ app.put("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
 });
 app.delete("/api/quizzes/:id", requireAdmin, async (req: AuthRequest, res) => {
   const owned = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!owned) return res.status(404).json({ error: "Quiz not found" });
-  await prisma.quiz.delete({ where: { id: owned.id } }); res.status(204).end();
+  // Sessions have no cascade on Quiz, so remove them first (participants/answers cascade from the session).
+  const sessions = await prisma.quizSession.findMany({ where: { quizId: owned.id }, select: { id: true, status: true } });
+  for (const s of sessions) {
+    if (s.status === "FINISHED") continue;
+    clearTimer(s.id);
+    io.to(room(s.id)).emit("quiz:finished", await finalResults(s.id));
+  }
+  await prisma.$transaction([
+    prisma.quizSession.deleteMany({ where: { quizId: owned.id } }),
+    prisma.quiz.delete({ where: { id: owned.id } })
+  ]);
+  res.status(204).end();
+});
+app.post("/api/quizzes/:id/duplicate", requireAdmin, async (req: AuthRequest, res) => {
+  const src = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId }, include: { questions: { orderBy: { order: "asc" }, include: { options: true } } } });
+  if (!src) return res.status(404).json({ error: "Quiz not found" });
+  const copy = await prisma.quiz.create({
+    data: {
+      title: `${src.title} (Copy)`.slice(0, 120), description: src.description, basePoints: src.basePoints, ownerId: req.adminId!,
+      questions: { create: src.questions.map((q, i) => ({ order: i, text: q.text, timeLimitSeconds: q.timeLimitSeconds, explanation: q.explanation, options: { create: q.options.map(o => ({ text: o.text, isCorrect: o.isCorrect })) } })) }
+    },
+    include: { _count: { select: { questions: true, sessions: true } } }
+  });
+  res.status(201).json(copy);
 });
 app.post("/api/quizzes/:id/questions", requireAdmin, async (req: AuthRequest, res) => {
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
@@ -59,18 +82,30 @@ app.post("/api/quizzes/:id/questions", requireAdmin, async (req: AuthRequest, re
   const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: true } });
   res.status(201).json(q);
 });
+async function hasLiveSession(quizId: string) {
+  return (await prisma.quizSession.count({ where: { quizId, status: { in: ["ACTIVE", "PAUSED", "BETWEEN_QUESTIONS"] } } })) > 0;
+}
+const LIVE_MSG = "A live session is running for this quiz. End it before changing questions.";
 app.put("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
   const q = await prisma.question.findFirst({ where: { id: String(req.params.id), quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
+  if (await hasLiveSession(q.quizId)) return res.status(409).json({ error: LIVE_MSG });
   const updated = await prisma.$transaction(async tx => {
     await tx.answerOption.deleteMany({ where: { questionId: q.id } });
-    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: true } });
+    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation ?? null, options: { create: parsed.data.options } }, include: { options: true } });
   });
   res.json(updated);
 });
 app.delete("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   const q = await prisma.question.findFirst({ where: { id: String(req.params.id), quiz: { ownerId: req.adminId } } }); if (!q) return res.status(404).json({ error: "Question not found" });
-  await prisma.question.delete({ where: { id: q.id } }); res.status(204).end();
+  if (await hasLiveSession(q.quizId)) return res.status(409).json({ error: LIVE_MSG });
+  await prisma.$transaction(async tx => {
+    await tx.question.delete({ where: { id: q.id } });
+    // Close the gap in "order" so new questions (order = count) never collide with the unique (quizId, order) index.
+    const rest = await tx.question.findMany({ where: { quizId: q.quizId }, orderBy: { order: "asc" }, select: { id: true, order: true } });
+    for (let i = 0; i < rest.length; i++) if (rest[i].order !== i) await tx.question.update({ where: { id: rest[i].id }, data: { order: i } });
+  });
+  res.status(204).end();
 });
 
 type PublicQuestion = { id: string; text: string; timeLimitSeconds: number; options: { id: string; text: string }[] };
@@ -144,12 +179,14 @@ app.get("/api/sessions/:id/results", requireAdmin, async (req: AuthRequest, res)
 io.on("connection", socket => {
   socket.on("host:join", async ({ sessionId, token }) => {
     try {
-      const session = await prisma.quizSession.findFirst({ where: { id: sessionId, quiz: { owner: { id: token } } } });
+      const adminId = verifyAdminToken(String(token ?? ""));
+      if (!adminId) return socket.emit("error:message", "Authentication failed. Please sign in again.");
+      const session = await prisma.quizSession.findFirst({ where: { id: String(sessionId), quiz: { ownerId: adminId } } });
       if (!session) return socket.emit("error:message", "Session not found or access denied");
-      socket.join(room(sessionId)); socket.data.hostSessionId = sessionId;
-      const count = await prisma.participant.count({ where: { sessionId } });
+      socket.join(room(session.id)); socket.data.hostSessionId = session.id;
+      const count = await prisma.participant.count({ where: { sessionId: session.id } });
       socket.emit("host:state", { session, participantCount: count });
-      await emitLobby(sessionId);
+      await emitLobby(session.id);
     } catch { socket.emit("error:message", "Could not join host session"); }
   });
   socket.on("participant:join", async ({ pin, name }) => {
@@ -160,7 +197,7 @@ io.on("connection", socket => {
       if (!session || session.status === "FINISHED") return socket.emit("join:error", "This game PIN is invalid or the quiz has ended");
       const count = await prisma.participant.count({ where: { sessionId: session.id } });
       if (count >= 150) return socket.emit("join:error", "This session has reached its 150 participant limit");
-      const token = crypto.randomUUID();
+      const token = randomUUID();
       const participant = await prisma.participant.create({ data: { sessionId: session.id, name: cleanName, token } });
       socket.data.participantId = participant.id; socket.data.sessionId = session.id;
       socket.join(room(session.id)); socket.join(`participant:${participant.id}`);
@@ -170,18 +207,22 @@ io.on("connection", socket => {
         const q = await publicQuestion(session.id, session.currentQuestionIndex);
         if (q) socket.emit("question:started", { question: q, questionIndex: session.currentQuestionIndex, deadline: session.deadline?.toISOString(), serverNow: new Date().toISOString() });
       }
-    } catch { socket.emit("join:error", "That name may already be in use. Try another name."); }
+    } catch (e: any) {
+      socket.emit("join:error", e?.code === "P2002" ? "That name is already taken in this room. Try another name." : "Could not join the game. Please try again.");
+    }
   });
   socket.on("participant:resume", async ({ participantToken }) => {
-    const p = await prisma.participant.findUnique({ where: { token: participantToken }, include: { session: true } });
-    if (!p) return socket.emit("join:error", "Your saved session could not be found");
-    socket.data.participantId = p.id; socket.data.sessionId = p.sessionId;
-    socket.join(room(p.sessionId)); socket.join(`participant:${p.id}`);
-    socket.emit("join:success", { participantId: p.id, participantToken, name: p.name, status: p.session.status });
-    if (p.session.status === "ACTIVE") {
-      const q = await publicQuestion(p.sessionId, p.session.currentQuestionIndex);
-      if (q) socket.emit("question:started", { question: q, questionIndex: p.session.currentQuestionIndex, deadline: p.session.deadline?.toISOString(), serverNow: new Date().toISOString() });
-    }
+    try {
+      const p = await prisma.participant.findUnique({ where: { token: String(participantToken ?? "") }, include: { session: { include: { quiz: true } } } });
+      if (!p) return socket.emit("join:error", "Your saved session could not be found");
+      socket.data.participantId = p.id; socket.data.sessionId = p.sessionId;
+      socket.join(room(p.sessionId)); socket.join(`participant:${p.id}`);
+      socket.emit("join:success", { participantId: p.id, participantToken, name: p.name, quizTitle: p.session.quiz.title, status: p.session.status });
+      if (p.session.status === "ACTIVE") {
+        const q = await publicQuestion(p.sessionId, p.session.currentQuestionIndex);
+        if (q) socket.emit("question:started", { question: q, questionIndex: p.session.currentQuestionIndex, deadline: p.session.deadline?.toISOString(), serverNow: new Date().toISOString() });
+      }
+    } catch { socket.emit("join:error", "Could not restore your session"); }
   });
   socket.on("participant:answer", async ({ participantToken, optionId }) => {
     try {

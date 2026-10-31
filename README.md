@@ -46,7 +46,8 @@ A full-stack quiz application designed for sessions of up to 150 participants.
 - Back up the database and rotate JWT secrets.
 
 ## Functional behavior
-- Admin can register/login, create quizzes/questions, launch sessions, pause/resume, advance, and end.
+- Admin can login, create/duplicate/delete quizzes, add/edit/delete questions, launch sessions, pause/resume, advance, and end.
+- Questions cannot be edited or deleted while a session of that quiz is running (active, paused or between questions).
 - Participants join by PIN, receive synchronized question state, and submit once per question.
 - The server calculates points using `floor(basePoints * remainingMs / totalMs)`.
 - Question leaderboard ranks correct submissions by server receipt timestamp, but never sends response times to clients.
