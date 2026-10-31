@@ -27,7 +27,7 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.post("/api/auth/login", async (req, res) => {
   const parsed = z.object({ email: z.string().email(), password: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid credentials" });
-  const admin = await prisma.admin.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
+  const admin = await prisma.admin.findUnique({where: { email: parsed.data.email.trim().toLowerCase() }});
   if (!admin || !(await bcrypt.compare(parsed.data.password, admin.passwordHash))) return res.status(401).json({ error: "Invalid email or password" });
   res.json({ token: signAdmin(admin.id), email: admin.email });
 });

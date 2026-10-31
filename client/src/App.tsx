@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { io, Socket } from "socket.io-client";
 import { motion, AnimatePresence } from "framer-motion";
-import { ArrowUpRight, Check, Clock3, Crown, LogOut, Play, Pause, Plus, Radio, Trophy, Users, Zap } from "lucide-react";
+import { ArrowUpRight, Check, Clock3, Crown, LogOut, Plus, Radio, Trophy, Users, Zap, Copy, Download } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 const SOCKET = import.meta.env.VITE_SOCKET_URL || API;
@@ -12,14 +13,16 @@ type FinalRow = { rank: number; name: string; totalPoints: number; breakdown: nu
 const socket: Socket = io(SOCKET, { autoConnect: true });
 
 function App() {
-  const [page, setPage] = useState<"home"|"login"|"dashboard"|"builder"|"host"|"join"|"play">("home");
+  const [page, setPage] = useState<"home"|"login"|"dashboard"|"newquiz"|"builder"|"host"|"join"|"play">("home");
   const [token, setToken] = useState(localStorage.getItem("adminToken") || "");
   const [email, setEmail] = useState(""); const [password, setPassword] = useState("");
   const [error, setError] = useState(""); const [quizzes, setQuizzes] = useState<any[]>([]);
   const [title, setTitle] = useState(""); const [description, setDescription] = useState(""); const [basePoints, setBasePoints] = useState(1000);
   const [questions, setQuestions] = useState<any[]>([]); const [qText, setQText] = useState(""); const [seconds, setSeconds] = useState(20);
   const [options, setOptions] = useState(["", "", "", ""]); const [correct, setCorrect] = useState(0); const [explanation, setExplanation] = useState("");
-  const [quizId, setQuizId] = useState(""); const [sessionId, setSessionId] = useState(""); const [pin, setPin] = useState("");
+  const [quizId, setQuizId] = useState(""); const [sessionId, setSessionId] = useState("");
+  const [pin, setPin] = useState(() => new URLSearchParams(window.location.search).get("pin")?.replace(/\D/g, "").slice(0, 6) || "");
+  const [joinUrl, setJoinUrl] = useState("");
   const [name, setName] = useState(""); const [participantToken, setParticipantToken] = useState(localStorage.getItem("participantToken") || "");
   const [participantId, setParticipantId] = useState(""); const [quizTitle, setQuizTitle] = useState("");
   const [activeQ, setActiveQ] = useState<Question|null>(null); const [deadline, setDeadline] = useState(0); const [now, setNow] = useState(Date.now());
@@ -29,6 +32,37 @@ function App() {
   const [progress, setProgress] = useState({answered:0,total:0}); const [status, setStatus] = useState("LOBBY");
 
   const remaining = Math.max(0, Math.ceil((deadline-now)/1000));
+  useEffect(() => {
+    const incomingPin = new URLSearchParams(window.location.search).get("pin");
+    if (incomingPin && /^\d{6}$/.test(incomingPin)) {
+      setPin(incomingPin);
+      setPage("join");
+    }
+  }, []);
+  useEffect(() => {
+    if (pin.length === 6) {
+      const url = new URL("/", window.location.origin);
+      url.searchParams.set("pin", pin);
+      setJoinUrl(url.toString());
+    } else {
+      setJoinUrl("");
+    }
+  }, [pin]);
+  async function copyJoinLink() {
+    if (!joinUrl) return;
+    try { await navigator.clipboard.writeText(joinUrl); setError("Join link copied."); }
+    catch { setError("Could not copy automatically. You can copy the join link manually."); }
+  }
+  function downloadJoinQr() {
+    const svg = document.getElementById("session-join-qr");
+    if (!svg) return;
+    const source = new XMLSerializer().serializeToString(svg);
+    const blob = new Blob([source], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = `quizroom-${pin}-qr.svg`; link.click();
+    URL.revokeObjectURL(url);
+  }
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 200); return () => clearInterval(t); }, []);
   const headers = useMemo(() => ({ "Content-Type":"application/json", ...(token ? {Authorization:`Bearer ${token}`} : {}) }), [token]);
   async function api(path:string, init:RequestInit={}) {
@@ -77,7 +111,7 @@ function App() {
     {page==="newquiz"&&<section className="panel narrow"><div className="eyebrow">NEW QUIZ</div><h2>Set the stage.</h2><form className="form" onSubmit={createQuiz}><label>Quiz title<input value={title} onChange={e=>setTitle(e.target.value)} required minLength={2}/></label><label>Description<textarea value={description} onChange={e=>setDescription(e.target.value)}/></label><label>Base points per question<input type="number" min="1" max="10000" value={basePoints} onChange={e=>setBasePoints(Number(e.target.value))}/></label><button className="button primary">Continue <ArrowUpRight size={16}/></button></form></section>}
     {page==="builder"&&<section className="content"><div className="section-head"><div><div className="eyebrow">QUESTION EDITOR</div><h2>Build your quiz.</h2><p className="muted">Every question has its own timer and one correct answer.</p></div><button className="button secondary" onClick={()=>setPage("dashboard")}>Done</button></div><div className="builder-layout"><form className="panel form" onSubmit={addQuestion}><label>Question<textarea value={qText} onChange={e=>setQText(e.target.value)} required/></label><div className="field-row"><label>Time limit (seconds)<input type="number" min="5" max="300" value={seconds} onChange={e=>setSeconds(Number(e.target.value))}/></label><label>Correct option<select value={correct} onChange={e=>setCorrect(Number(e.target.value))}>{options.map((_,i)=><option value={i} key={i}>Option {i+1}</option>)}</select></label></div><div className="options-editor">{options.map((o,i)=><label key={i}>Option {i+1}<input value={o} onChange={e=>setOptions(options.map((v,j)=>j===i?e.target.value:v))} required/></label>)}</div><label>Explanation (optional)<textarea value={explanation} onChange={e=>setExplanation(e.target.value)}/></label><button className="button primary">Add question <Plus size={16}/></button></form><aside className="question-list"><h3>Added questions <span>{questions.length}</span></h3>{questions.map((q,i)=><div className="question-item" key={q.id}><b>{String(i+1).padStart(2,"0")}</b><div>{q.text}<small>{q.timeLimitSeconds}s · {q.options.length} options</small></div></div>)}{!questions.length&&<p className="muted">Your questions will appear here.</p>}</aside></div></section>}
     {page==="join"&&<section className="panel narrow"><div className="eyebrow">PLAYER ENTRY</div><h2>Find your room.</h2><p className="muted">Enter the six-digit game PIN shared by your host.</p><form className="form" onSubmit={joinGame}><label>Game PIN<input className="pin-input" inputMode="numeric" maxLength={6} value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,""))} placeholder="000 000" required/></label><label>Your display name<input value={name} onChange={e=>setName(e.target.value)} maxLength={32} required/></label><button className="button primary">Join game <ArrowUpRight size={16}/></button></form></section>}
-    {page==="host"&&<section className="content"><div className="section-head"><div><div className="eyebrow">LIVE SESSION · HOST VIEW</div><h2>Room {pin}</h2><p className="muted">Share this PIN with participants. The room supports up to 150 players.</p></div><div className="status-pill"><span className="live-dot"/>{status.replaceAll("_"," ")}</div></div><div className="host-grid"><div className="panel"><div className="stat"><Users/><strong>{lobby.count}</strong><span>Participants joined</span></div><div className="participant-list">{lobby.participants.map(p=><span key={p.id}>{p.name}</span>)}</div></div><div className="panel host-controls"><h3>Session controls</h3><p className="muted">Answers submitted: {progress.answered} / {progress.total||lobby.count}</p>{status==="LOBBY"&&button("Start quiz",()=>socket.emit("host:start",{sessionId}))}{status==="ACTIVE"&&<>{button("Pause quiz",()=>socket.emit("host:pause",{sessionId}),"secondary")}{button("End quiz",()=>socket.emit("host:end",{sessionId}),"danger")}</>}{status==="PAUSED"&&button("Resume quiz",()=>socket.emit("host:resume",{sessionId}))}{status==="BETWEEN_QUESTIONS"&&button("Next question",()=>socket.emit("host:next",{sessionId}))}{status==="FINISHED"&&<p>Quiz completed. Final results are available to participants.</p>}</div></div></section>}
+    {page==="host"&&<section className="content"><div className="section-head"><div><div className="eyebrow">LIVE SESSION · HOST VIEW</div><h2>Room {pin}</h2><p className="muted">Share this PIN with participants. The room supports up to 150 players.</p></div><div className="status-pill"><span className="live-dot"/>{status.replaceAll("_"," ")}</div></div><div className="host-grid"><div className="panel"><div className="stat"><Users/><strong>{lobby.count}</strong><span>Participants joined</span></div><div className="participant-list">{lobby.participants.map(p=><span key={p.id}>{p.name}</span>)}</div></div><div className="panel join-qr-panel"><div className="eyebrow">SCAN TO JOIN</div><h3>Let players scan in.</h3><p className="muted">Scan this QR code with a phone camera to open the join page with the game PIN filled in.</p>{joinUrl&&<div className="join-qr"><QRCodeSVG id="session-join-qr" value={joinUrl} size={190} level="H" includeMargin /></div>}<div className="qr-pin">GAME PIN <strong>{pin}</strong></div><div className="qr-actions"><button className="button secondary" onClick={()=>void copyJoinLink()}><Copy size={15}/> Copy join link</button><button className="button primary" onClick={downloadJoinQr}><Download size={15}/> Download QR</button></div></div><div className="panel host-controls"><h3>Session controls</h3><p className="muted">Answers submitted: {progress.answered} / {progress.total||lobby.count}</p>{status==="LOBBY"&&button("Start quiz",()=>socket.emit("host:start",{sessionId}))}{status==="ACTIVE"&&<>{button("Pause quiz",()=>socket.emit("host:pause",{sessionId}),"secondary")}{button("End quiz",()=>socket.emit("host:end",{sessionId}),"danger")}</>}{status==="PAUSED"&&button("Resume quiz",()=>socket.emit("host:resume",{sessionId}))}{status==="BETWEEN_QUESTIONS"&&button("Next question",()=>socket.emit("host:next",{sessionId}))}{status==="FINISHED"&&<p>Quiz completed. Final results are available to participants.</p>}</div></div></section>}
     {page==="play"&&<section className="play-area">
       {status==="LOBBY"&&<div className="panel narrow center"><div className="eyebrow">YOU'RE IN</div><h2>You're on the list, {name}.</h2><p className="muted">Waiting for the host to start {quizTitle}. Keep this screen open.</p><div className="waiting-indicator"><span/><span/><span/></div></div>}
       {status==="ACTIVE"&&activeQ&&!result&&<motion.div className="question-stage" initial={{opacity:0,y:12}} animate={{opacity:1,y:0}}><div className="question-top"><span className="eyebrow">QUESTION IN PROGRESS</span><div className={`timer ${remaining<=5?"urgent":""}`}><Clock3 size={17}/>{remaining}s</div></div><h2>{activeQ.text}</h2><div className="answer-list">{activeQ.options.map((o,i)=><button key={o.id} disabled={submitted||remaining<=0} className={`answer-option ${selected===o.id?"selected":""}`} onClick={()=>setSelected(o.id)}><span className="option-letter">{String.fromCharCode(65+i)}</span><span>{o.text}</span>{selected===o.id&&<Check size={18}/>}</button>)}</div>{submitted?<p className="submitted"><Check size={16}/> Answer submitted. You're all set.</p>:<button className="button primary submit-answer" disabled={!selected||remaining<=0} onClick={submitAnswer}>Submit answer <ArrowUpRight size={16}/></button>}</motion.div>}
