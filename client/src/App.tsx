@@ -4,8 +4,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ArrowUpRight, Check, Clock3, Crown, LogOut, Plus, Radio, Trophy, Users, Zap, Copy, Download } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
-const SOCKET = import.meta.env.VITE_SOCKET_URL || API;
+const API = import.meta.env.VITE_API_URL || window.location.origin;
+const SOCKET = import.meta.env.VITE_SOCKET_URL || window.location.origin;
 type Option = { id: string; text: string };
 type Question = { id: string; text: string; timeLimitSeconds: number; options: Option[] };
 type Leader = { rank: number; name: string; points: number };

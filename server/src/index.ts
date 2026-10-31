@@ -8,6 +8,7 @@ import { Server } from "socket.io";
 import { z } from "zod";
 import { prisma } from "./db.js";
 import { requireAdmin, signAdmin, type AuthRequest } from "./auth.js";
+import { resolve } from "node:path";
 
 const app = express();
 const httpServer = createServer(app);
@@ -237,6 +238,14 @@ io.on("connection", socket => {
     clearTimer(sessionId); await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "FINISHED", endedAt: new Date(), deadline: null } });
     io.to(room(sessionId)).emit("quiz:finished", await finalResults(sessionId));
   });
+});
+// Serve the React frontend from the same Render service.
+const clientDist = resolve(process.cwd(), "client", "dist");
+
+app.use(express.static(clientDist));
+
+app.get("/{*path}", (_req, res) => {
+  res.sendFile(resolve(clientDist, "index.html"));
 });
 
 const port = Number(process.env.PORT ?? 4000);
