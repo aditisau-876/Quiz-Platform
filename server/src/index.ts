@@ -32,7 +32,7 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token: signAdmin(admin.id), email: admin.email });
 });
 app.get("/api/quizzes", requireAdmin, async (req: AuthRequest, res) => {
-  const quizzes = await prisma.quiz.findMany({ where: { ownerId: req.adminId }, include: { _count: { select: { questions: true, sessions: true } } }, orderBy: { updatedAt: "desc" } });
+  const quizzes = await prisma.quiz.findMany({ where: { ownerId: req.adminId }, include: { _count: { select: { questions: true, sessions: true } }, sessions: { select: { pin: true }, orderBy: { createdAt: "desc" }, take: 1 } }, orderBy: { updatedAt: "desc" } });
   res.json(quizzes);
 });
 app.post("/api/quizzes", requireAdmin, async (req: AuthRequest, res) => {
@@ -167,6 +167,18 @@ app.post("/api/quizzes/:id/sessions", requireAdmin, async (req: AuthRequest, res
   if (!quiz) return res.status(404).json({ error: "Quiz not found" });
   const questionCount = await prisma.question.count({ where: { quizId: quiz.id } });
   if (questionCount === 0) return res.status(400).json({ error: "Add at least one question before starting a session" });
+  // Keep ONE permanent room (and PIN) per quiz: relaunching resets the existing session instead of creating a new PIN.
+  const existing = await prisma.quizSession.findFirst({ where: { quizId: quiz.id }, orderBy: { createdAt: "desc" } });
+  if (existing) {
+    clearTimer(existing.id);
+    if (existing.status !== "FINISHED") io.to(room(existing.id)).emit("quiz:finished", await finalResults(existing.id));
+    io.in(room(existing.id)).socketsLeave(room(existing.id));
+    const [, reset] = await prisma.$transaction([
+      prisma.participant.deleteMany({ where: { sessionId: existing.id } }),
+      prisma.quizSession.update({ where: { id: existing.id }, data: { status: "LOBBY", currentQuestionIndex: -1, questionStartedAt: null, deadline: null, pausedRemainingMs: null, endedAt: null } })
+    ]);
+    return res.status(201).json(reset);
+  }
   let pin = ""; for (let i = 0; i < 10; i++) { pin = String(Math.floor(100000 + Math.random() * 900000)); if (!(await prisma.quizSession.findUnique({ where: { pin } }))) break; }
   const session = await prisma.quizSession.create({ data: { pin, quizId: quiz.id } });
   res.status(201).json(session);
