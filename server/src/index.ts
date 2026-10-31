@@ -1,5 +1,6 @@
 import "dotenv/config";
-import express from "express";\nimport jwt from "jsonwebtoken";
+import express from "express";
+import jwt from "jsonwebtoken";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { createServer } from "node:http";
