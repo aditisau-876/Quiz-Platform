@@ -19,6 +19,9 @@ const questionInput = z.object({
   text: z.string().min(1).max(1000),
   timeLimitSeconds: z.number().int().min(5).max(300),
   explanation: z.string().max(2000).optional(),
+  basePoints: z.number().int().min(0).max(10000).optional(),
+  negativePoints: z.number().int().min(0).max(10000).optional(),
+  isTieBreaker: z.boolean().optional(),
   options: z.array(z.object({ text: z.string().min(1).max(300), isCorrect: z.boolean() })).min(2).max(6)
 }).refine(q => q.options.filter(o => o.isCorrect).length === 1, "Exactly one option must be correct");
 const quizInput = z.object({ title: z.string().min(2).max(120), description: z.string().max(1000).optional(), basePoints: z.number().int().min(1).max(10000) });
@@ -69,7 +72,7 @@ app.post("/api/quizzes/:id/duplicate", requireAdmin, async (req: AuthRequest, re
   const copy = await prisma.quiz.create({
     data: {
       title: `${src.title} (Copy)`.slice(0, 120), description: src.description, basePoints: src.basePoints, ownerId: req.adminId!,
-      questions: { create: src.questions.map((q, i) => ({ order: i, text: q.text, timeLimitSeconds: q.timeLimitSeconds, explanation: q.explanation, options: { create: q.options.map(o => ({ text: o.text, isCorrect: o.isCorrect })) } })) }
+      questions: { create: src.questions.map((q, i) => ({ order: i, text: q.text, timeLimitSeconds: q.timeLimitSeconds, explanation: q.explanation, basePoints: q.basePoints, negativePoints: q.negativePoints, isTieBreaker: q.isTieBreaker, options: { create: q.options.map(o => ({ text: o.text, isCorrect: o.isCorrect })) } })) }
     },
     include: { _count: { select: { questions: true, sessions: true } } }
   });
@@ -79,7 +82,7 @@ app.post("/api/quizzes/:id/questions", requireAdmin, async (req: AuthRequest, re
   const parsed = questionInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
   const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } }); if (!quiz) return res.status(404).json({ error: "Quiz not found" });
   const order = await prisma.question.count({ where: { quizId: quiz.id } });
-  const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
+  const q = await prisma.question.create({ data: { quizId: quiz.id, order, text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation, basePoints: parsed.data.basePoints ?? quiz.basePoints, negativePoints: parsed.data.negativePoints ?? 0, isTieBreaker: parsed.data.isTieBreaker ?? false, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
   res.status(201).json(q);
 });
 async function hasLiveSession(quizId: string) {
@@ -92,7 +95,7 @@ app.put("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => {
   if (await hasLiveSession(q.quizId)) return res.status(409).json({ error: LIVE_MSG });
   const updated = await prisma.$transaction(async tx => {
     await tx.answerOption.deleteMany({ where: { questionId: q.id } });
-    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation ?? null, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
+    return tx.question.update({ where: { id: q.id }, data: { text: parsed.data.text, timeLimitSeconds: parsed.data.timeLimitSeconds, explanation: parsed.data.explanation ?? null, basePoints: parsed.data.basePoints ?? q.basePoints, negativePoints: parsed.data.negativePoints ?? q.negativePoints, isTieBreaker: parsed.data.isTieBreaker ?? q.isTieBreaker, options: { create: parsed.data.options } }, include: { options: { orderBy: { id: "asc" } } } });
   });
   res.json(updated);
 });
@@ -108,72 +111,120 @@ app.delete("/api/questions/:id", requireAdmin, async (req: AuthRequest, res) => 
   res.status(204).end();
 });
 
-type PublicQuestion = { id: string; text: string; timeLimitSeconds: number; options: { id: string; text: string }[] };
+type PublicQuestion = { id: string; text: string; timeLimitSeconds: number; basePoints: number; negativePoints: number; isTieBreaker: boolean; options: { id: string; text: string }[] };
+const hostRoom = (id: string) => `host:${id}`;
+// Participants allowed to answer the running tie-breaker, per session (in memory, like the question timers).
+const tieEligible = new Map<string, Set<string>>();
 const room = (id: string) => `session:${id}`;
 const timerHandles = new Map<string, NodeJS.Timeout>();
 async function publicQuestion(sessionId: string, index: number): Promise<PublicQuestion | null> {
   const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { questions: { orderBy: { order: "asc" }, include: { options: { orderBy: { id: "asc" } } } } } } } });
   const q = session?.quiz.questions[index]; if (!q) return null;
-  return { id: q.id, text: q.text, timeLimitSeconds: q.timeLimitSeconds, options: q.options.map(o => ({ id: o.id, text: o.text })) };
+  return { id: q.id, text: q.text, timeLimitSeconds: q.timeLimitSeconds, basePoints: q.basePoints, negativePoints: q.negativePoints, isTieBreaker: q.isTieBreaker, options: q.options.map(o => ({ id: o.id, text: o.text })) };
 }
 async function emitLobby(sessionId: string) {
   const participants = await prisma.participant.findMany({ where: { sessionId }, select: { id: true, name: true } });
   io.to(room(sessionId)).emit("lobby:update", { count: participants.length, participants });
 }
 async function finishQuestion(sessionId: string) {
-  const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: true, participants: { include: { answers: true } } } });
+  const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { questions: { orderBy: { order: "asc" } } } }, participants: { include: { answers: true } } } });
   if (!session || session.status !== "ACTIVE") return;
   const index = session.currentQuestionIndex;
   const q = await prisma.question.findFirst({ where: { quizId: session.quizId, order: index }, include: { options: { orderBy: { id: "asc" } } } });
   if (!q) return;
-  const ranked = session.participants
+  // A tie-breaker only involves the tied players; everything else involves everyone.
+  const eligible = q.isTieBreaker ? tieEligible.get(sessionId) : undefined;
+  const players = eligible ? session.participants.filter(p => eligible.has(p.id)) : session.participants;
+  if (q.isTieBreaker) {
+    // Record "no answer" rows so this tie-breaker counts as used even if nobody answered.
+    await prisma.participantAnswer.createMany({ data: players.filter(p => !p.answers.some(a => a.questionId === q.id)).map(p => ({ participantId: p.id, questionId: q.id, status: "UNANSWERED" as const, points: 0 })), skipDuplicates: true });
+  }
+  const ranked = players
     .map(p => ({ participantId: p.id, name: p.name, answer: p.answers.find(a => a.questionId === q.id) }))
     .filter(x => x.answer?.status === "CORRECT")
     .sort((a, b) => (a.answer!.responseMs ?? Infinity) - (b.answer!.responseMs ?? Infinity))
     .slice(0, 3)
     .map((x, i) => ({ rank: i + 1, name: x.name, points: x.answer!.points }));
-  const individual = session.participants.map(p => {
+  const individual = players.map(p => {
     const answer = p.answers.find(a => a.questionId === q.id);
     return { participantId: p.id, correct: answer?.status === "CORRECT", points: answer?.points ?? 0, totalPoints: p.answers.reduce((sum, a) => sum + a.points, 0) };
   });
   await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "BETWEEN_QUESTIONS", deadline: null } });
   const optionCounts: Record<string, number> = {};
   let answeredCount = 0, correctCount = 0;
-  for (const p of session.participants) {
-    const a = p.answers.find(x => x.questionId === q.id); if (!a) continue;
+  for (const p of players) {
+    const a = p.answers.find(x => x.questionId === q.id); if (!a || a.status === "UNANSWERED") continue;
     answeredCount++; if (a.status === "CORRECT") correctCount++;
     if (a.optionId) optionCounts[a.optionId] = (optionCounts[a.optionId] ?? 0) + 1;
   }
-  const totalQuestions = await prisma.question.count({ where: { quizId: session.quizId } });
-  io.to(room(sessionId)).emit("question:results", {
+  const normal = session.quiz.questions.filter(x => !x.isTieBreaker);
+  const target = eligible ? [hostRoom(sessionId), ...players.map(p => `participant:${p.id}`)] : room(sessionId);
+  io.to(target).emit("question:results", {
     questionId: q.id, questionText: q.text, options: q.options.map(o => ({ id: o.id, text: o.text })), explanation: q.explanation, leaderboard: ranked,
     correctOptionId: q.options.find(o => o.isCorrect)?.id ?? null, optionCounts,
-    answered: answeredCount, correctCount, total: session.participants.length,
-    questionNumber: index + 1, totalQuestions, isLast: index + 1 >= totalQuestions
+    answered: answeredCount, correctCount, total: players.length,
+    isTieBreaker: q.isTieBreaker, questionNumber: q.isTieBreaker ? 0 : normal.findIndex(x => x.id === q.id) + 1, totalQuestions: normal.length,
+    isLast: q.isTieBreaker || !normal.some(x => x.order > index)
   });
-  for (const result of individual) io.to(`participant:${result.participantId}`).emit("participant:result", { correct: result.correct, points: result.points, totalPoints: result.totalPoints });
+  for (const result of individual) io.to(`participant:${result.participantId}`).emit("participant:result", { correct: result.correct, points: result.points, totalPoints: result.totalPoints, isTieBreaker: q.isTieBreaker });
 }
 function clearTimer(id: string) { const t = timerHandles.get(id); if (t) clearTimeout(t); timerHandles.delete(id); }
-async function activateQuestion(sessionId: string, index: number) {
+async function finishSession(sessionId: string) {
+  clearTimer(sessionId); tieEligible.delete(sessionId);
+  await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "FINISHED", endedAt: new Date(), deadline: null } });
+  io.to(room(sessionId)).emit("quiz:finished", await finalResults(sessionId));
+}
+// Regular questions run in order; tie-breaker questions are skipped and only used on demand.
+async function nextNormalIndex(quizId: string, after: number) {
+  const q = await prisma.question.findFirst({ where: { quizId, isTieBreaker: false, order: { gt: after } }, orderBy: { order: "asc" }, select: { order: true } });
+  return q?.order ?? null;
+}
+async function activateQuestion(sessionId: string, index: number, audience?: string[]) {
   clearTimer(sessionId);
   const q = await publicQuestion(sessionId, index);
-  if (!q) {
-    await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "FINISHED", endedAt: new Date(), deadline: null } });
-    const final = await finalResults(sessionId); io.to(room(sessionId)).emit("quiz:finished", final); return;
-  }
+  if (!q) return finishSession(sessionId);
   const start = new Date(); const deadline = new Date(start.getTime() + q.timeLimitSeconds * 1000);
   await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "ACTIVE", currentQuestionIndex: index, questionStartedAt: start, deadline, pausedRemainingMs: null } });
-  io.to(room(sessionId)).emit("question:started", { question: q, questionIndex: index, startedAt: start.toISOString(), deadline: deadline.toISOString(), serverNow: new Date().toISOString() });
+  io.to(audience ?? room(sessionId)).emit("question:started", { question: q, questionIndex: index, startedAt: start.toISOString(), deadline: deadline.toISOString(), serverNow: new Date().toISOString() });
   timerHandles.set(sessionId, setTimeout(() => void finishQuestion(sessionId), q.timeLimitSeconds * 1000));
 }
-async function finalResults(sessionId: string) {
+type StandingRow = { id: string; name: string; totalPoints: number; tieWins: number; tieMs: number; breakdown: number[]; rank: number; tied: boolean };
+async function standings(sessionId: string) {
   const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { questions: { orderBy: { order: "asc" } } } }, participants: { include: { answers: true } } } });
-  if (!session) return { leaderboard: [], questions: [] };
-  const leaderboard = session.participants.map(p => ({
-    name: p.name, totalPoints: p.answers.reduce((s, a) => s + a.points, 0),
-    breakdown: session.quiz.questions.map(q => p.answers.find(a => a.questionId === q.id)?.points ?? 0)
-  })).sort((a, b) => b.totalPoints - a.totalPoints).map((p, i) => ({ rank: i + 1, ...p }));
-  return { leaderboard, questions: session.quiz.questions.map(q => ({ id: q.id, text: q.text })) };
+  if (!session) return null;
+  const tieIds = new Set(session.quiz.questions.filter(q => q.isTieBreaker).map(q => q.id));
+  const normal = session.quiz.questions.filter(q => !q.isTieBreaker);
+  const base = session.participants.map(p => {
+    const wins = p.answers.filter(a => tieIds.has(a.questionId) && a.status === "CORRECT");
+    return { id: p.id, name: p.name, totalPoints: p.answers.reduce((s, a) => s + a.points, 0), tieWins: wins.length, tieMs: wins.reduce((s, a) => s + (a.responseMs ?? 0), 0), breakdown: normal.map(q => p.answers.find(a => a.questionId === q.id)?.points ?? 0) };
+  }).sort((a, b) => b.totalPoints - a.totalPoints || b.tieWins - a.tieWins || (a.tieWins > 0 ? a.tieMs - b.tieMs : 0) || a.name.localeCompare(b.name));
+  // Two players are still tied only if points AND tie-breaker results are identical.
+  const same = (a: typeof base[number], b: typeof base[number]) => a.totalPoints === b.totalPoints && a.tieWins === b.tieWins && (a.tieWins === 0 || a.tieMs === b.tieMs);
+  let rank = 0;
+  const ranked = base.map((r, i) => { if (i === 0 || !same(base[i - 1], r)) rank = i + 1; return { ...r, rank }; });
+  const sizes = new Map<number, number>(); for (const r of ranked) sizes.set(r.rank, (sizes.get(r.rank) ?? 0) + 1);
+  const rows: StandingRow[] = ranked.map(r => ({ ...r, tied: (sizes.get(r.rank) ?? 0) > 1 }));
+  // The highest tied group that shows up in the top 15.
+  const first = rows.find(r => r.tied && r.rank <= 15);
+  const group = first ? rows.filter(r => r.rank === first.rank) : [];
+  const tie = first ? { rank: first.rank, ids: group.map(r => r.id), names: group.map(r => r.name), count: group.length } : null;
+  return { session, normal, rows, tie };
+}
+async function unusedTieQuestions(sessionId: string, quizId: string) {
+  const used = await prisma.participantAnswer.findMany({ where: { participant: { sessionId }, question: { isTieBreaker: true } }, select: { questionId: true }, distinct: ["questionId"] });
+  return prisma.question.findMany({ where: { quizId, isTieBreaker: true, id: { notIn: used.map(u => u.questionId) } }, orderBy: { order: "asc" } });
+}
+async function finalResults(sessionId: string) {
+  const st = await standings(sessionId);
+  if (!st) return { leaderboard: [], questions: [], totalParticipants: 0, tie: null, tieBreakersLeft: 0 };
+  const left = await unusedTieQuestions(sessionId, st.session.quizId);
+  return {
+    leaderboard: st.rows.map(({ id, tieMs, ...r }) => r),
+    questions: st.normal.map(q => ({ id: q.id, text: q.text })),
+    totalParticipants: st.rows.length,
+    tie: st.tie ? { rank: st.tie.rank, names: st.tie.names, count: st.tie.count } : null,
+    tieBreakersLeft: left.length
+  };
 }
 app.post("/api/quizzes/:id/sessions", requireAdmin, async (req: AuthRequest, res) => {
   const quiz = await prisma.quiz.findFirst({ where: { id: String(req.params.id), ownerId: req.adminId } });
@@ -183,7 +234,7 @@ app.post("/api/quizzes/:id/sessions", requireAdmin, async (req: AuthRequest, res
   // Keep ONE permanent room (and PIN) per quiz: relaunching resets the existing session instead of creating a new PIN.
   const existing = await prisma.quizSession.findFirst({ where: { quizId: quiz.id }, orderBy: { createdAt: "desc" } });
   if (existing) {
-    clearTimer(existing.id);
+    clearTimer(existing.id); tieEligible.delete(existing.id);
     if (existing.status !== "FINISHED") io.to(room(existing.id)).emit("quiz:finished", await finalResults(existing.id));
     io.in(room(existing.id)).socketsLeave(room(existing.id));
     const [, reset] = await prisma.$transaction([
@@ -208,7 +259,7 @@ io.on("connection", socket => {
       if (!adminId) return socket.emit("error:message", "Authentication failed. Please sign in again.");
       const session = await prisma.quizSession.findFirst({ where: { id: String(sessionId), quiz: { ownerId: adminId } } });
       if (!session) return socket.emit("error:message", "Session not found or access denied");
-      socket.join(room(session.id)); socket.data.hostSessionId = session.id;
+      socket.join(room(session.id)); socket.join(hostRoom(session.id)); socket.data.hostSessionId = session.id;
       const count = await prisma.participant.count({ where: { sessionId: session.id } });
       socket.emit("host:state", { session, participantCount: count });
       await emitLobby(session.id);
@@ -220,6 +271,7 @@ io.on("connection", socket => {
       if (!/^\d{6}$/.test(String(pin)) || cleanName.length < 2) return socket.emit("join:error", "Enter a valid six-digit PIN and a name of at least 2 characters");
       const session = await prisma.quizSession.findUnique({ where: { pin: String(pin) }, include: { quiz: true } });
       if (!session || session.status === "FINISHED") return socket.emit("join:error", "This game PIN is invalid or the quiz has ended");
+      if (tieEligible.has(session.id)) return socket.emit("join:error", "A tie-breaker is in progress. Please try again later.");
       const count = await prisma.participant.count({ where: { sessionId: session.id } });
       if (count >= 150) return socket.emit("join:error", "This session has reached its 150 participant limit");
       const token = randomUUID();
@@ -243,7 +295,8 @@ io.on("connection", socket => {
       socket.data.participantId = p.id; socket.data.sessionId = p.sessionId;
       socket.join(room(p.sessionId)); socket.join(`participant:${p.id}`);
       socket.emit("join:success", { participantId: p.id, participantToken, name: p.name, quizTitle: p.session.quiz.title, status: p.session.status });
-      if (p.session.status === "ACTIVE") {
+      const tieSet = tieEligible.get(p.sessionId);
+      if (p.session.status === "ACTIVE" && (!tieSet || tieSet.has(p.id))) {
         const q = await publicQuestion(p.sessionId, p.session.currentQuestionIndex);
         if (q) socket.emit("question:started", { question: q, questionIndex: p.session.currentQuestionIndex, deadline: p.session.deadline?.toISOString(), serverNow: new Date().toISOString() });
       }
@@ -257,16 +310,18 @@ io.on("connection", socket => {
       if (receivedAt.getTime() > p.session.deadline.getTime()) return socket.emit("answer:error", "Time is up");
       const q = await prisma.question.findFirst({ where: { quizId: p.session.quizId, order: p.session.currentQuestionIndex }, include: { options: { orderBy: { id: "asc" } } } });
       if (!q || !q.options.some(o => o.id === optionId)) return socket.emit("answer:error", "Invalid answer option");
+      if (q.isTieBreaker && !tieEligible.get(p.sessionId)?.has(p.id)) return socket.emit("answer:error", "You are not part of this tie-breaker");
       const correct = q.options.some(o => o.id === optionId && o.isCorrect);
       const totalMs = q.timeLimitSeconds * 1000;
       // Use the server-owned deadline so paused time does not consume answer time.
       const remainingMs = Math.max(0, Math.min(totalMs, p.session.deadline.getTime() - receivedAt.getTime()));
       const elapsedMs = totalMs - remainingMs;
-      const points = correct ? Math.max(0, Math.floor(p.session.quiz.basePoints * remainingMs / totalMs)) : 0;
+      // Per-question scoring: faster correct answers earn up to basePoints; wrong answers lose negativePoints; tie-breakers carry no points.
+      const points = q.isTieBreaker ? 0 : correct ? Math.max(0, Math.floor(q.basePoints * remainingMs / totalMs)) : -q.negativePoints;
       await prisma.participantAnswer.create({ data: { participantId: p.id, questionId: q.id, optionId, status: correct ? "CORRECT" : "INCORRECT", points, submittedAt: receivedAt, responseMs: elapsedMs } });
       socket.emit("answer:accepted", { submitted: true });
       const answered = await prisma.participantAnswer.count({ where: { questionId: q.id, participant: { sessionId: p.sessionId } } });
-      const total = await prisma.participant.count({ where: { sessionId: p.sessionId } });
+      const total = q.isTieBreaker ? (tieEligible.get(p.sessionId)?.size ?? 0) : await prisma.participant.count({ where: { sessionId: p.sessionId } });
       io.to(room(p.sessionId)).emit("host:progress", { answered, total });
     } catch (e: any) {
       if (e?.code === "P2002") socket.emit("answer:error", "You have already submitted an answer");
@@ -275,14 +330,34 @@ io.on("connection", socket => {
   });
   socket.on("host:start", async ({ sessionId }) => {
     if (socket.data.hostSessionId !== sessionId) return;
-    const session = await prisma.quizSession.findUnique({ where: { id: sessionId }, include: { quiz: { include: { owner: true, questions: true } } } });
-    if (!session || session.status !== "LOBBY" || !session.quiz.questions.length) return;
-    await activateQuestion(sessionId, 0);
+    const session = await prisma.quizSession.findUnique({ where: { id: sessionId } });
+    if (!session || session.status !== "LOBBY") return;
+    const first = await nextNormalIndex(session.quizId, -1);
+    if (first === null) return socket.emit("error:message", "Add at least one regular (non tie-breaker) question first.");
+    await activateQuestion(sessionId, first);
   });
   socket.on("host:next", async ({ sessionId }) => {
     if (socket.data.hostSessionId !== sessionId) return;
     const session = await prisma.quizSession.findUnique({ where: { id: sessionId } }); if (!session || session.status !== "BETWEEN_QUESTIONS") return;
-    await activateQuestion(sessionId, session.currentQuestionIndex + 1);
+    const cur = await prisma.question.findFirst({ where: { quizId: session.quizId, order: session.currentQuestionIndex }, select: { isTieBreaker: true } });
+    if (cur?.isTieBreaker) return void (await finishSession(sessionId));
+    const next = await nextNormalIndex(session.quizId, session.currentQuestionIndex);
+    if (next === null) return void (await finishSession(sessionId));
+    await activateQuestion(sessionId, next);
+  });
+  socket.on("host:tiebreak", async ({ sessionId }) => {
+    if (socket.data.hostSessionId !== sessionId) return;
+    try {
+      const session = await prisma.quizSession.findUnique({ where: { id: sessionId } });
+      if (!session || session.status !== "FINISHED") return;
+      const st = await standings(sessionId);
+      if (!st?.tie) return socket.emit("error:message", "There is no tie to break.");
+      const [q] = await unusedTieQuestions(sessionId, session.quizId);
+      if (!q) return socket.emit("error:message", "No unused tie-breaker question left. Mark another question as a tie-breaker in the quiz editor.");
+      tieEligible.set(sessionId, new Set(st.tie.ids));
+      io.to(room(sessionId)).emit("tiebreaker:wait", { names: st.tie.names });
+      await activateQuestion(sessionId, q.order, [hostRoom(sessionId), ...st.tie.ids.map(id => `participant:${id}`)]);
+    } catch { socket.emit("error:message", "Could not start the tie-breaker"); }
   });
   socket.on("host:pause", async ({ sessionId }) => {
     if (socket.data.hostSessionId !== sessionId) return;
@@ -301,8 +376,7 @@ io.on("connection", socket => {
   });
   socket.on("host:end", async ({ sessionId }) => {
     if (socket.data.hostSessionId !== sessionId) return;
-    clearTimer(sessionId); await prisma.quizSession.update({ where: { id: sessionId }, data: { status: "FINISHED", endedAt: new Date(), deadline: null } });
-    io.to(room(sessionId)).emit("quiz:finished", await finalResults(sessionId));
+    await finishSession(sessionId);
   });
 });
 

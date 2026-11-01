@@ -56,3 +56,11 @@ A full-stack quiz application designed for sessions of up to 150 participants.
 
 ## Important limitations
 This is a working single-server implementation foundation, not a claim of production load certification. Before a public event, run a 150-client load test in the target hosting environment, configure rate limits and monitoring, and use Redis-backed Socket.IO/timers if deploying multiple server instances.
+
+## Scoring, tie-breakers and admin login
+
+- Each question has its own **base points** (max for the fastest correct answer) and **negative marks** (deducted for a wrong answer; unanswered = 0). Totals can go below zero.
+- Mark a question as **Tie-breaker** in the editor. It is skipped in the normal flow and carries no points. After the final results, if players share a rank inside the top 15, the host sees "Start tie-breaker question". Only the tied players answer; the fastest correct answer wins. If still tied, repeat with another tie-breaker question.
+- Final results show the top 15 (each player also sees their own rank).
+- **Upgrade:** run `npx prisma migrate deploy` in `server/` (adds the new question columns and copies each quiz's old base points onto its questions), then `npx prisma generate` and rebuild.
+- **Change admin login:** set the new `ADMIN_EMAIL` / `ADMIN_PASSWORD` and run `npm run seed` in `server/`. With a single admin account the same account is updated, so quizzes stay.
